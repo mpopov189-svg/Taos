@@ -1,0 +1,19 @@
+# FREE, TEST-ONLY deployment: simulated trades, no exchange credentials.
+# Render Free instances may sleep; filesystem is ephemeral and paper history resets
+# after a restart/redeploy. Never use this plan for live trading.
+services:
+  - type: web
+    name: misho-autobot-demo
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: MODE
+        value: paper
+      - key: DATA_DIR
+        value: /app/data
+      - key: PUBLIC_DEPLOYMENT
+        value: '1'
+      - key: BOT_PASSWORD
+        sync: false
