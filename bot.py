@@ -141,6 +141,43 @@ class Store:
             self.save()
 
 
+class CoinbasePaperMarket:
+    """Public BTC/EUR prices for the local simulation; never submits orders."""
+    mode = 'paper'
+
+    def __init__(self):
+        self._candle_hour = None
+        self._closes = None
+
+    def _get(self, suffix):
+        request = Request('https://api.exchange.coinbase.com/products/' + SYMBOL + suffix,
+                          headers={'Accept': 'application/json', 'User-Agent': 'MishoAutoBot/1.0'})
+        with urlopen(request, timeout=15) as response:
+            return json.load(response)
+
+    def market(self):
+        now = time.time()
+        hour = int(now // 3600) * 3600
+        # Hourly history changes only after a candle closes; avoid polling it every tick.
+        if self._candle_hour != hour:
+            candles = self._get('/candles?granularity=3600')
+            if not isinstance(candles, list):
+                raise RuntimeError('Невалидна история на BTC/EUR от Coinbase')
+            completed = sorted((row for row in candles if int(row[0]) < hour),
+                               key=lambda row: int(row[0]))[-100:]
+            closes = [float(row[4]) for row in completed]
+            if (len(closes) < 35 or any(v <= 0 or not math.isfinite(v) for v in closes)
+                    or int(completed[-1][0]) < hour - 7200):
+                raise RuntimeError('Няма достатъчно актуални завършени свещи за BTC/EUR')
+            self._closes, self._candle_hour = closes, hour
+        ticker = self._get('/ticker')
+        price = float(ticker['price'])
+        stamp = datetime.fromisoformat(ticker['time'].replace('Z', '+00:00')).timestamp()
+        if price <= 0 or not math.isfinite(price) or not -60 <= now - stamp <= 300:
+            raise RuntimeError('Цената на BTC/EUR е невалидна или остаряла')
+        return list(self._closes), price
+
+
 class OKX:
     def __init__(self, mode='paper'):
         self.mode = mode

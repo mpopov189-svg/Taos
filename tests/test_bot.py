@@ -25,9 +25,6 @@ class BotTests(unittest.TestCase):
         self.assertEqual(dformat(0.003154, '0.00001'), '0.00315')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 class FakeAPI:
     mode = 'paper'
     def __init__(self):
@@ -57,3 +54,45 @@ class TraderIntegrationTests(unittest.TestCase):
             self.assertEqual(store.state['trades'], 2)
             self.assertEqual(store.state['position_qty'], 0)
             self.assertLess(store.state['paper_cash'], 500)
+
+
+class PublicMarketTests(unittest.TestCase):
+    def fixture(self, now):
+        from datetime import datetime, timezone
+        hour = int(now // 3600) * 3600
+        candles = [[hour - i * 3600, 90, 200, 100, 9999 if i == 0 else 100 + i, 1]
+                   for i in range(41)]
+        ticker = {'price': '125.00', 'time': datetime.fromtimestamp(now, timezone.utc).isoformat()}
+        return candles, ticker
+
+    def test_open_candle_excluded_and_hourly_history_cached(self):
+        from unittest.mock import patch
+        from bot import CoinbasePaperMarket
+        now = 2000000000
+        candles, ticker = self.fixture(now)
+        market = CoinbasePaperMarket()
+        with patch('bot.time.time', return_value=now), patch.object(
+                market, '_get', side_effect=[candles, ticker, ticker]) as get:
+            closes, price = market.market()
+            self.assertEqual(len(closes), 40)
+            self.assertNotIn(9999, closes)
+            self.assertEqual(closes[-1], 101)
+            self.assertEqual(price, 125)
+            market.market()
+            self.assertEqual(get.call_count, 3)
+
+    def test_stale_ticker_is_rejected(self):
+        from unittest.mock import patch
+        from bot import CoinbasePaperMarket
+        now = 2000000000
+        candles, _ = self.fixture(now)
+        _, ticker = self.fixture(now - 1000)
+        market = CoinbasePaperMarket()
+        with patch('bot.time.time', return_value=now), patch.object(
+                market, '_get', side_effect=[candles, ticker]):
+            with self.assertRaisesRegex(RuntimeError, 'остаряла'):
+                market.market()
+
+
+if __name__ == '__main__':
+    unittest.main()

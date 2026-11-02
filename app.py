@@ -9,7 +9,7 @@ import secrets
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
-from bot import Store, OKX, Trader, loop
+from bot import Store, OKX, CoinbasePaperMarket, Trader, loop
 
 CSS = '''
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b1020;color:#f2f6ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
@@ -31,6 +31,7 @@ def e(x):
 def page(state, token):
     mode = state['mode']
     mode_label = {'paper': 'ДЕМО · Виртуални €', 'okx_demo': 'OKX Демо', 'live': 'РЕАЛНИ ПАРИ'}[mode]
+    market_label = 'Данни от Coinbase · симулирани сделки' if mode == 'paper' else 'Данни от OKX'
     warnings = ''
     if state.get('halted'):
         warnings += '<div class="banner warning"><b>ЗАЩИТНО СПИРАНЕ.</b> Неизяснена борсова поръчка — нужна ръчна проверка.</div>'
@@ -42,7 +43,7 @@ def page(state, token):
     toggle = 'Продължи' if state['paused'] else 'Пауза'
     return f'''<!doctype html><html lang="bg"><head><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta charset="utf-8"><meta http-equiv="refresh" content="90"><title>Мишо AutoBot</title><style>{CSS}</style></head>
-<body><main><div class="top"><div><h1>Мишо AutoBot</h1><span class="muted">BTC / EUR · Автоматична спот търговия</span></div>
+<body><main><div class="top"><div><h1>Мишо AutoBot</h1><span class="muted">BTC / EUR · Автоматична спот търговия</span><br><span class="muted">{e(market_label)}</span></div>
 <span class="tag">{e(mode_label)}</span></div>{warnings}<div class="grid">
 <div class="tile"><div class="label">Оценка на сметката</div><div class="value">{state['total_value']:.2f} €</div></div>
 <div class="tile"><div class="label">Цена на Bitcoin</div><div class="value">{state['last_price']:.2f} €</div></div>
@@ -147,7 +148,7 @@ def main():
     if (mode != 'paper' or os.getenv('PUBLIC_DEPLOYMENT') == '1') and not os.getenv('BOT_PASSWORD'):
         raise RuntimeError('Set BOT_PASSWORD before starting a public dashboard or connecting an exchange.')
     store = Store(os.getenv('DATA_DIR', './data'))
-    api = OKX(mode)
+    api = CoinbasePaperMarket() if mode == 'paper' else OKX(mode)
     trader = Trader(store, api)
     http = ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '8080'))), Handler)
     http.daemon_threads = True
