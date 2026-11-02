@@ -41,10 +41,20 @@ def page(state, token):
     if not history:
         history = '<li class="muted">Още няма сделки. Ботът изчаква пазарен сигнал.</li>'
     toggle = 'Продължи' if state['paused'] else 'Пауза'
+    activity = 'На пауза' if state['paused'] else 'Ботът е включен'
+    explanation = ('Сделките са спрени. Натисни „Продължи“, за да включиш бота.'
+                   if state['paused'] else
+                   'Ботът проверява пазара приблизително през 90 секунди. Купува само при сигнал — може да има часове без сделка.')
+    if state.get('halted') or state.get('last_error'):
+        activity = 'Нужна е проверка'
+        explanation = 'Виж съобщението за грешка по-горе. Нови сделки не се изпълняват при неуспешна пазарна проверка.'
     return f'''<!doctype html><html lang="bg"><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta charset="utf-8"><meta http-equiv="refresh" content="90"><title>Мишо AutoBot</title><style>{CSS}</style></head>
+<meta charset="utf-8"><meta http-equiv="refresh" content="15"><title>Мишо AutoBot</title><style>{CSS}</style></head>
 <body><main><div class="top"><div><h1>Мишо AutoBot</h1><span class="muted">BTC / EUR · Автоматична спот търговия</span><br><span class="muted">{e(market_label)}</span></div>
-<span class="tag">{e(mode_label)}</span></div>{warnings}<div class="grid">
+<span class="tag">{e(mode_label)}</span></div>{warnings}
+<div class="banner"><b>{e(activity)}</b><p class="note">{e(explanation)}</p>
+<p class="muted">Панелът се обновява автоматично през 15 секунди.</p>
+<form action="/" method="get"><button>Обнови панела</button></form></div><div class="grid">
 <div class="tile"><div class="label">Оценка на сметката</div><div class="value">{state['total_value']:.2f} €</div></div>
 <div class="tile"><div class="label">Цена на Bitcoin</div><div class="value">{state['last_price']:.2f} €</div></div>
 <div class="tile"><div class="label">Позиция</div><div class="value">{state['position_qty']:.6f} BTC</div></div>
@@ -133,6 +143,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._response(409, 'Bot is halted after an uncertain order; manual review is required.')
                 return
             store.state['paused'] = not store.state['paused']
+            store.state['status'] = ('Пауза' if store.state['paused'] else
+                                     'Продължава — изчаква следващата пазарна проверка')
             store.save()
         self._response(303, '', headers={'Location': '/'})
 
