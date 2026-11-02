@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import secrets
+import signal
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
@@ -37,9 +38,19 @@ def page(state, token):
         warnings += '<div class="banner warning"><b>ЗАЩИТНО СПИРАНЕ.</b> Неизяснена борсова поръчка — нужна ръчна проверка.</div>'
     if state.get('last_error'):
         warnings += '<div class="banner warning">Грешка: ' + e(state['last_error']) + '</div>'
+    if not state.get('persistent_storage'):
+        warnings += '<div class="banner warning"><b>Временна тестова среда.</b> Историята може да се изгуби при рестарт. За работа 24/7 са необходими постоянен сървър и диск.</div>'
     history = ''.join('<li><b>' + e(t['message']) + '</b><div class="muted">' + e(t['time']) + ' UTC</div></li>' for t in state.get('history', []))
     if not history:
         history = '<li class="muted">Още няма сделки. Ботът изчаква пазарен сигнал.</li>'
+    decisions = ''.join('<li><b>' + e(row['status']) + '</b><div class="muted">' +
+                        e(row['time']) + ' UTC · ' + e(row['signal']) + '</div></li>'
+                        for row in state.get('decisions', [])[:10])
+    indicators = state.get('indicators', {})
+    conditions = ''.join('<li>' + title + ': <b>' + ('ДА' if indicators.get(key) else 'НЕ') + '</b></li>'
+                         for key, title in [('trend_ok', 'Възходящ кратък тренд'),
+                             ('momentum_ok', 'RSI в диапазона 47–67'),
+                             ('price_ok', 'Цена в допустимия диапазон')]) if indicators else '<li>Изчаква първа успешна проверка.</li>'
     toggle = 'Продължи' if state['paused'] else 'Пауза'
     activity = 'На пауза' if state['paused'] else 'Ботът е включен'
     explanation = ('Сделките са спрени. Натисни „Продължи“, за да включиш бота.'
@@ -55,6 +66,8 @@ def page(state, token):
 <div class="banner"><b>{e(activity)}</b><p class="note">{e(explanation)}</p>
 <p class="muted">Панелът се обновява автоматично през 15 секунди.</p>
 <form action="/" method="get"><button>Обнови панела</button></form></div><div class="grid">
+<div class="tile"><div class="label">Извършени проверки</div><div class="value">{state.get('checks', 0)}</div></div>
+<div class="tile"><div class="label">Изпълнени сделки</div><div class="value">{state['trades']}</div></div>
 <div class="tile"><div class="label">Оценка на сметката</div><div class="value">{state['total_value']:.2f} €</div></div>
 <div class="tile"><div class="label">Цена на Bitcoin</div><div class="value">{state['last_price']:.2f} €</div></div>
 <div class="tile"><div class="label">Позиция</div><div class="value">{state['position_qty']:.6f} BTC</div></div>
@@ -62,7 +75,11 @@ def page(state, token):
 <div class="tile wide"><div class="label">Какво прави в момента</div><div class="value" style="font-size:20px">{e(state['status'])}</div>
 <p class="muted">{e(state['last_signal'])}</p><p class="muted">Последна проверка: {e(state['last_check'] or 'няма')} (UTC)</p>
 <form action="/toggle" method="post"><input type="hidden" name="csrf" value="{e(token)}"><button>{toggle}</button></form></div></div>
+<h2 style="font-size:19px">Условия за нова покупка</h2><ul>{conditions}</ul>
+<p class="muted">Последни успешни данни: {e(state.get('last_success') or 'няма')} UTC · Съхранение: {'постоянно' if state.get('persistent_storage') else 'временно'}</p>
 <h2 style="margin-top:28px;font-size:19px">Последни сделки</h2><ul>{history}</ul>
+<form action="/export" method="get"><button>Изтегли историята</button></form>
+<h2 style="font-size:19px">Последни проверки и решения</h2><ul>{decisions or '<li>Първата проверка предстои.</li>'}</ul>
 <p class="note">*Реализираният резултат при реален режим е приблизителен и не включва пълно отчитане на такси и данъци. Демо режимът ползва примерна такса. Ботът следва правила, а не самообучаващ се AI. Няма гарантирана печалба. Стоп-защитите не гарантират цена при срив, загубена връзка или волатилност. Никога не разрешавай тегления чрез API ключове.</p>
 </main></body></html>'''
 
@@ -103,17 +120,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/health':
-            self._response(200, json.dumps({'ok': True}), 'application/json; charset=utf-8')
+            worker = getattr(self.server, 'worker', None)
+            healthy = worker is None or worker.is_alive()
+            self._response(200 if healthy else 503, json.dumps({'ok': healthy, 'engine_alive': healthy}), 'application/json; charset=utf-8')
             return
-        if path != '/':
+        if path not in ('/', '/export', '/api/status'):
             self._response(404, 'Not found')
             return
         if not self._auth():
             return
         store = self.server.store
-        with store.lock:
-            view = dict(store.state)
-            view['history'] = list(store.state['history'])
+        view = store.snapshot()
+        view['persistent_storage'] = store.persistent
+        if path in ('/export', '/api/status'):
+            headers = {'Content-Disposition': 'attachment; filename="misho-autobot-history.json"'} if path == '/export' else None
+            self._response(200, json.dumps(view, ensure_ascii=False, indent=2), 'application/json; charset=utf-8', headers)
+            return
         self._response(200, page(view, self.server.csrf))
 
     def do_POST(self):
@@ -166,9 +188,23 @@ def main():
     http.daemon_threads = True
     http.store = store
     http.csrf = secrets.token_urlsafe(32)
-    threading.Thread(target=loop, args=(trader,), daemon=True).start()
+    stop = threading.Event()
+    http.worker = threading.Thread(target=loop, args=(trader, stop), daemon=True)
+    http.worker.start()
+    def shutdown(signum, frame):
+        stop.set()
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, shutdown)
     print(f'Misho AutoBot {mode}: dashboard listening on port {http.server_port}', flush=True)
-    http.serve_forever(poll_interval=0.5)
+    try:
+        http.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        http.server_close()
+        http.worker.join(timeout=35)
+        store.save()
 
 
 if __name__ == '__main__':

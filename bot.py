@@ -4,6 +4,7 @@ This is RULE-BASED algorithmic trading, not predictive AI. Not investment advice
 """
 from __future__ import annotations
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -89,7 +90,14 @@ def evaluate(closes, price, position, entry, high):
         return 'hold', 'Задържане на позицията', fast, slow, momentum
     if fast > slow and 47 <= momentum <= 67 and price <= fast * 1.018:
         return 'buy', 'Възходящ тренд с умерен импулс', fast, slow, momentum
-    return 'hold', 'Няма достатъчно добър сигнал', fast, slow, momentum
+    missing = []
+    if fast <= slow:
+        missing.append('краткият тренд не е над дългия')
+    if not 47 <= momentum <= 67:
+        missing.append(f'RSI {momentum:.0f} е извън диапазона 47–67')
+    if price > fast * 1.018:
+        missing.append('цената е твърде високо над краткия тренд')
+    return 'hold', 'Изчаква: ' + '; '.join(missing), fast, slow, momentum
 
 
 def default_state():
@@ -101,6 +109,9 @@ def default_state():
         'last_error': '', 'status': 'Стартиране', 'last_check': '',
         'last_price': 0, 'last_signal': 'Очаква данни', 'total_value': 500.0,
         'mode': os.environ.get('MODE', 'paper').strip().lower(),
+        'checks': 0, 'checking': False, 'last_success': '',
+        'decisions': [], 'ledger': [], 'position_cost_eur': 0.0,
+        'indicators': {}, 'starts': 0, 'started_at': '',
     }
 
 
@@ -109,9 +120,17 @@ class Store:
         self.path = Path(folder) / 'state.json'
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.persistent = os.path.ismount(self.path.parent)
+        if os.getenv('REQUIRE_PERSISTENT_DATA') == '1' and not self.persistent:
+            raise RuntimeError('DATA_DIR must be the mounted persistent disk; refusing ephemeral storage.')
         if self.path.exists():
             with self.path.open('r', encoding='utf-8') as f:
-                self.state = json.load(f)
+                loaded = json.load(f)
+            if not isinstance(loaded, dict) or not all(k in loaded for k in ('mode', 'paper_cash', 'position_qty')):
+                raise RuntimeError('Stored state is invalid; refusing to reset the account.')
+            self.state = {**default_state(), **loaded}
+            if 'position_cost_eur' not in loaded and loaded['mode'] == 'paper':
+                self.state['position_cost_eur'] = loaded['position_qty'] * loaded['entry'] / (1 - FEE_ESTIMATE)
         else:
             self.state = default_state()
             self.save()
@@ -122,6 +141,14 @@ class Store:
                 raise RuntimeError('Existing state is for another mode. Use a new empty DATA_DIR.')
             self.state['mode'] = mode
             self.save()
+        self.state['starts'] += 1
+        self.state['started_at'] = now_utc()
+        self.state['checking'] = False
+        self.save()
+
+    def snapshot(self):
+        with self.lock:
+            return copy.deepcopy(self.state)
 
     def save(self):
         with self.lock:
@@ -132,6 +159,13 @@ class Store:
                 os.fsync(f.fileno())
                 filename = f.name
             os.replace(filename, self.path)
+            # Persist the directory entry too, so the atomic rename survives a crash.
+            if hasattr(os, 'O_DIRECTORY'):
+                fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
 
     def log(self, text, price=None):
         with self.lock:
@@ -300,16 +334,32 @@ class Trader:
     def tick(self):
         if not self.action_lock.acquire(blocking=False):
             return
+        with self.store.lock:
+            self.store.state['checks'] += 1
+            self.store.state['last_check'] = now_utc()
+            self.store.state['checking'] = True
         try:
-            self._tick()
+            # Network I/O does not hold the dashboard lock in the deployed paper mode.
+            market = self.api.market() if self.api.mode == 'paper' else None
+            with self.store.lock:
+                self._tick(market)
         except Exception as exc:
-            self.store.state['last_error'] = str(exc)[:240]
-            self.store.state['status'] = 'Грешка — нови сделки не са изпълнени'
-            self.store.save()
+            with self.store.lock:
+                self.store.state['last_error'] = str(exc)[:240]
+                self.store.state['status'] = 'Грешка — нови сделки не са изпълнени'
         finally:
-            self.action_lock.release()
+            try:
+                with self.store.lock:
+                    s = self.store.state
+                    s['checking'] = False
+                    s['decisions'].insert(0, {'time': now_utc(), 'status': s['status'],
+                        'signal': s['last_signal'], 'price': s['last_price'], 'error': s['last_error']})
+                    s['decisions'] = s['decisions'][:120]
+                    self.store.save()
+            finally:
+                self.action_lock.release()
 
-    def _tick(self):
+    def _tick(self, market=None):
         s = self.store.state
         s['last_check'] = now_utc()
         if s.get('halted'):
@@ -325,11 +375,16 @@ class Trader:
                 raise
             if s.get('pending'):
                 return
-        closes, price = self.api.market()
+        closes, price = market if market is not None else self.api.market()
         s['last_price'] = price
         s['high'] = max(s['high'], price) if s['position_qty'] else 0
         position = s['position_qty'] > 0
         action, reason, fast, slow, strength = evaluate(closes, price, position, s['entry'], s['high'])
+        s['last_success'] = now_utc()
+        s['last_error'] = ''
+        s['indicators'] = {'ema10': fast, 'ema30': slow, 'rsi14': strength,
+            'trend_ok': fast > slow, 'momentum_ok': 47 <= strength <= 67,
+            'price_ok': price <= fast * 1.018, 'signal': action}
         s['last_signal'] = f'{reason} · RSI {strength:.0f} · EMA10 {fast:.0f} / EMA30 {slow:.0f}'
         if self.api.mode == 'paper':
             s['total_value'] = round(s['paper_cash'] + s['paper_btc'] * price, 2)
@@ -370,6 +425,11 @@ class Trader:
                 s['position_qty'] = qty
                 s['entry'] = price
                 s['high'] = price
+                s['position_cost_eur'] = spend
+                s['ledger'].append({'id': uuid.uuid4().hex, 'time': now_utc(), 'mode': 'paper',
+                    'side': 'buy', 'quantity_btc': qty, 'price_eur': price,
+                    'cash_change_eur': -spend, 'fee_eur': spend * FEE_ESTIMATE,
+                    'realized_eur': 0.0})
                 self.store.log(f'ДЕМО КУПУВА {qty:.8f} BTC за {spend:.2f} EUR', price)
             else:
                 self.api.instrument()  # Verify allowed market
@@ -380,7 +440,13 @@ class Trader:
                 received = qty * price * (1 - FEE_ESTIMATE)
                 s['paper_cash'] += received
                 s['paper_btc'] = max(0.0, s['paper_btc'] - qty)
-                s['realized_eur'] += received - qty * s['entry']
+                profit = received - s['position_cost_eur']
+                s['realized_eur'] += profit
+                s['ledger'].append({'id': uuid.uuid4().hex, 'time': now_utc(), 'mode': 'paper',
+                    'side': 'sell', 'quantity_btc': qty, 'price_eur': price,
+                    'cash_change_eur': received, 'fee_eur': qty * price * FEE_ESTIMATE,
+                    'realized_eur': profit})
+                s['position_cost_eur'] = 0.0
                 s['position_qty'] = s['entry'] = s['high'] = 0
                 self.store.log(f'ДЕМО ПРОДАВА {qty:.8f} BTC за {received:.2f} EUR', price)
             else:
@@ -395,6 +461,8 @@ class Trader:
                 self._submit_safe('sell', qty_txt, 'base_ccy')
         s['last_trade'] = time.time() if self.api.mode == 'paper' else s['last_trade']
         s['trades'] += 1 if self.api.mode == 'paper' else 0
+        if self.api.mode == 'paper':
+            s['total_value'] = round(s['paper_cash'] + s['paper_btc'] * price, 2)
         s['last_error'] = ''
         self.store.save()
 
@@ -417,7 +485,8 @@ class Trader:
             self.store.log('СПРЯН: необходима проверка на поръчката. ' + str(exc)[:120])
 
 
-def loop(trader):
-    while True:
+def loop(trader, stop=None):
+    stop = stop if stop is not None else threading.Event()
+    while not stop.is_set():
         trader.tick()
-        time.sleep(POLL_SECONDS)
+        stop.wait(POLL_SECONDS)
